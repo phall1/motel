@@ -41,9 +41,9 @@ const textResponse = (value: string) => HttpServerResponse.text(value)
 const htmlResponse = (value: string) => HttpServerResponse.html(value)
 const notFoundResponse = (message = "Not found") => jsonResponse({ error: message }, 404)
 const requestUrl = (request: { readonly url: string }) => new URL(request.url, config.otel.baseUrl)
-const withStore = <A>(f: (store: TelemetryStore["Service"]) => Effect.Effect<A, Error>) => Effect.flatMap(TelemetryStore.asEffect(), f)
-const withTraceQuery = <A>(f: (query: TraceQueryService["Service"]) => Effect.Effect<A, Error>) => Effect.flatMap(TraceQueryService.asEffect(), f)
-const withLogQuery = <A>(f: (query: LogQueryService["Service"]) => Effect.Effect<A, Error>) => Effect.flatMap(LogQueryService.asEffect(), f)
+const withStore = <A>(f: (store: TelemetryStore["Service"]) => Effect.Effect<A, Error>) => Effect.flatMap(TelemetryStore, f)
+const withTraceQuery = <A>(f: (query: TraceQueryService["Service"]) => Effect.Effect<A, Error>) => Effect.flatMap(TraceQueryService, f)
+const withLogQuery = <A>(f: (query: LogQueryService["Service"]) => Effect.Effect<A, Error>) => Effect.flatMap(LogQueryService, f)
 type OtlpHttpRequest = {
 	readonly headers: Readonly<Record<string, string | undefined>>
 	readonly json: Effect.Effect<unknown, unknown>
@@ -167,7 +167,7 @@ const loadLogsPage = (input: {
 	readonly lookbackMinutes: number
 	readonly cursor: CursorShape | null
 }) =>
-	Effect.flatMap(LogQueryService.asEffect(), (store) =>
+	Effect.flatMap(LogQueryService, (store) =>
 		Effect.map(
 			store.searchLogs({
 				serviceName: input.serviceName,
@@ -314,7 +314,7 @@ const TelemetryGroupLive = HttpApiBuilder.group(
 				respondRaw(
 					Effect.flatMap(otlpRequestBody(request, decodeTraceProtobuf), (payload) =>
 						Effect.map(
-							Effect.flatMap(AsyncIngest.asEffect(), (ingest) => ingest.ingestTraces({ payload })),
+							Effect.flatMap(AsyncIngest, (ingest) => ingest.ingestTraces({ payload })),
 							(result) => jsonResponse(result),
 						),
 					),
@@ -324,7 +324,7 @@ const TelemetryGroupLive = HttpApiBuilder.group(
 				respondRaw(
 					Effect.flatMap(otlpRequestBody(request, decodeLogProtobuf), (payload) =>
 						Effect.map(
-							Effect.flatMap(AsyncIngest.asEffect(), (ingest) => ingest.ingestLogs({ payload })),
+							Effect.flatMap(AsyncIngest, (ingest) => ingest.ingestLogs({ payload })),
 							(result) => jsonResponse(result),
 						),
 					),
