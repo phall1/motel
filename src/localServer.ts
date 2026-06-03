@@ -89,6 +89,13 @@ const parseLookbackMinutes = (value: string | null, fallback: number) => {
 
 const parseBoundedLookbackMinutes = (value: string | null, fallback: number, max: number) => clamp(parseLookbackMinutes(value, fallback), 1, max)
 
+// For ID-scoped fetches (a specific trace/span), a time window is the wrong
+// default — the ID already bounds the result set, and a 60m default silently
+// hides logs from older traces. Returns undefined (= unbounded) unless the
+// caller explicitly passes `lookback`.
+const parseOptionalLookbackMinutes = (value: string | null, max: number): number | undefined =>
+	value == null || value.trim() === "" ? undefined : clamp(parseLookbackMinutes(value, max), 1, max)
+
 const attributeFiltersFromQuery = (url: URL) =>
 	attributeFiltersFromEntries(url.searchParams.entries())
 
@@ -116,9 +123,10 @@ const formatLookback = (minutes: number) => {
 	return `${minutes}m`
 }
 
-const listMeta = (input: { readonly limit: number; readonly lookbackMinutes: number; readonly returned: number; readonly truncated: boolean; readonly nextCursor: string | null }) => ({
+const listMeta = (input: { readonly limit: number; readonly lookbackMinutes: number | undefined; readonly returned: number; readonly truncated: boolean; readonly nextCursor: string | null }) => ({
 	limit: input.limit,
-	lookback: formatLookback(input.lookbackMinutes),
+	// `undefined` lookback = unbounded (ID-scoped fetches); report it honestly.
+	lookback: input.lookbackMinutes == null ? "all" : formatLookback(input.lookbackMinutes),
 	returned: input.returned,
 	truncated: input.truncated,
 	nextCursor: input.nextCursor,
@@ -139,7 +147,7 @@ const paginateSummaries = (summaries: readonly TraceSummaryItem[], options: { re
 	}
 }
 
-const paginateLogs = (logs: readonly LogItem[], options: { readonly limit: number; readonly lookbackMinutes: number; readonly cursor: CursorShape | null }) => {
+const paginateLogs = (logs: readonly LogItem[], options: { readonly limit: number; readonly lookbackMinutes: number | undefined; readonly cursor: CursorShape | null }) => {
 	const page = logs.slice(0, options.limit)
 	const last = page.at(-1)
 
@@ -164,7 +172,7 @@ const loadLogsPage = (input: {
 	readonly attributeFilters?: Readonly<Record<string, string>>
 	readonly attributeContainsFilters?: Readonly<Record<string, string>>
 	readonly limit: number
-	readonly lookbackMinutes: number
+	readonly lookbackMinutes: number | undefined
 	readonly cursor: CursorShape | null
 }) =>
 	Effect.flatMap(LogQueryService, (store) =>
@@ -434,7 +442,7 @@ const TelemetryGroupLive = HttpApiBuilder.group(
 			.handleRaw("traceLogs", ({ params, request }) =>
 				respondRaw(Effect.gen(function*() {
 					const url = requestUrl(request)
-					const lookbackMinutes = parseBoundedLookbackMinutes(url.searchParams.get("lookback"), LOG_DEFAULT_LOOKBACK, LOG_MAX_LOOKBACK)
+					const lookbackMinutes = parseOptionalLookbackMinutes(url.searchParams.get("lookback"), LOG_MAX_LOOKBACK)
 					const limit = parseBoundedLimit(url.searchParams.get("limit"), LOG_DEFAULT_LIMIT, LOG_MAX_LIMIT)
 					const cursor = decodeCursor(url.searchParams.get("cursor"))
 					return jsonResponse(yield* loadLogsPage({ traceId: params.traceId, limit, lookbackMinutes, cursor }))
@@ -446,7 +454,7 @@ const TelemetryGroupLive = HttpApiBuilder.group(
 			.handleRaw("spanLogs", ({ params, request }) =>
 				respondRaw(Effect.gen(function*() {
 					const url = requestUrl(request)
-					const lookbackMinutes = parseBoundedLookbackMinutes(url.searchParams.get("lookback"), LOG_DEFAULT_LOOKBACK, LOG_MAX_LOOKBACK)
+					const lookbackMinutes = parseOptionalLookbackMinutes(url.searchParams.get("lookback"), LOG_MAX_LOOKBACK)
 					const limit = parseBoundedLimit(url.searchParams.get("limit"), LOG_DEFAULT_LIMIT, LOG_MAX_LIMIT)
 					const cursor = decodeCursor(url.searchParams.get("cursor"))
 					return jsonResponse(yield* loadLogsPage({ spanId: params.spanId, limit, lookbackMinutes, cursor }))

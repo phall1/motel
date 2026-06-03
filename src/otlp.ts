@@ -61,10 +61,21 @@ export interface OtlpLogRecord {
 	readonly timeUnixNano?: string
 	readonly observedTimeUnixNano?: string
 	readonly severityText?: string
+	readonly severityNumber?: number
 	readonly body?: OtlpAnyValue
 	readonly attributes?: readonly OtlpKeyValue[]
 	readonly traceId?: string
 	readonly spanId?: string
+}
+
+// OTLP severity_number → severity_text per the spec's range buckets
+// (1-4 TRACE, 5-8 DEBUG, 9-12 INFO, 13-16 WARN, 17-20 ERROR, 21-24 FATAL).
+// Used as a fallback so emitters that send only the number don't all collapse
+// to "INFO". Returns undefined for absent/out-of-range numbers.
+const SEVERITY_TEXT_BY_BUCKET = ["TRACE", "DEBUG", "INFO", "WARN", "ERROR", "FATAL"] as const
+export const severityTextFromNumber = (severityNumber: number | undefined): string | undefined => {
+	if (severityNumber == null || severityNumber < 1 || severityNumber > 24) return undefined
+	return SEVERITY_TEXT_BY_BUCKET[Math.floor((severityNumber - 1) / 4)]
 }
 
 export interface OtlpScopeLogs {

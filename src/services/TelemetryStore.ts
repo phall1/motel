@@ -5,7 +5,7 @@ import { Clock, Effect, Layer, Schedule, Context } from "effect"
 import { config } from "../config.js"
 import type { AiCallDetail, AiCallSummary, FacetItem, LogItem, SpanItem, StatsItem, TraceItem, TraceSummaryItem, TraceSpanEvent, TraceSpanItem } from "../domain.js"
 import { AI_FIELD_KEYS, AI_FTS_KEYS, AI_TEXT_SEARCH_KEYS, GEN_AI_EXECUTE_TOOL, GEN_AI_MARKER_KEYS, GEN_AI_OPERATION_KEY, GEN_AI_TOOL_NAME_KEY, truncatePreview } from "../domain.js"
-import { attributeMap, nanosToMilliseconds, parseAnyValue, spanKindLabel, spanStatusLabel, stringifyValue, type OtlpLogExportRequest, type OtlpTraceExportRequest } from "../otlp.js"
+import { attributeMap, nanosToMilliseconds, parseAnyValue, severityTextFromNumber, spanKindLabel, spanStatusLabel, stringifyValue, type OtlpLogExportRequest, type OtlpTraceExportRequest } from "../otlp.js"
 
 const isSqliteLockError = (error: unknown) =>
 	error instanceof Error && /(database is locked|database table is locked|SQLITE_BUSY)/i.test(error.message)
@@ -1208,7 +1208,7 @@ export const makeTelemetryStoreLayer = (opts: TelemetryStoreOptions) => Layer.ef
 									attributes.spanId || attributes.span_id || record.spanId || null,
 									serviceName,
 									scopeName,
-									record.severityText ?? "INFO",
+									record.severityText ?? severityTextFromNumber(record.severityNumber) ?? "INFO",
 									timestampMs,
 									body,
 									JSON.stringify(attributes),

@@ -105,24 +105,36 @@ export const relevantLogAttributes = (log: LogItem) =>
 export const traceUiUrl = (traceId: string) => resolveOtelUrl(`/trace/${traceId}`)
 export const webUiUrl = () => resolveOtelUrl(`/traces`)
 
+// Clipboard backends in preference order: Wayland, X11 (xclip/xsel), macOS,
+// then WSL/Windows. The first binary that exists on PATH and exits 0 wins, so
+// motel copies work on Linux/Wayland/X11/WSL — not just macOS `pbcopy`.
+const CLIPBOARD_BACKENDS: ReadonlyArray<readonly string[]> = [
+	["wl-copy"],
+	["xclip", "-selection", "clipboard"],
+	["xsel", "--clipboard", "--input"],
+	["pbcopy"],
+	["clip.exe"],
+]
+
 export const copyToClipboard = async (value: string) => {
-	const proc = Bun.spawn({
-		cmd: ["pbcopy"],
-		stdin: "pipe",
-		stdout: "ignore",
-		stderr: "pipe",
-	})
-
-	if (!proc.stdin) {
-		throw new Error("Clipboard is not available")
+	const errors: string[] = []
+	for (const cmd of CLIPBOARD_BACKENDS) {
+		try {
+			const proc = Bun.spawn({ cmd: [...cmd], stdin: "pipe", stdout: "ignore", stderr: "pipe" })
+			proc.stdin.write(value)
+			proc.stdin.end()
+			const exitCode = await proc.exited
+			if (exitCode === 0) return
+			const stderr = await new Response(proc.stderr).text()
+			errors.push(`${cmd[0]}: ${stderr.trim() || `exit ${exitCode}`}`)
+		} catch {
+			// binary not on PATH (ENOENT) or pipe failure — try the next backend
+		}
 	}
-
-	proc.stdin.write(value)
-	proc.stdin.end()
-
-	const exitCode = await proc.exited
-	if (exitCode !== 0) {
-		const stderr = await new Response(proc.stderr).text()
-		throw new Error(stderr.trim() || "Could not copy OTEL server details")
-	}
+	const tried = CLIPBOARD_BACKENDS.map((c) => c[0]).join(", ")
+	throw new Error(
+		errors.length > 0
+			? `Clipboard copy failed (${errors.join("; ")})`
+			: `No clipboard backend found. Install one of: ${tried}.`,
+	)
 }
