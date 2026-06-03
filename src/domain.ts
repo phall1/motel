@@ -146,6 +146,59 @@ export const AI_ATTR_MAP = {
 } as const
 
 /**
+ * Convention-agnostic resolution for the normalized AI-call fields.
+ *
+ * motel speaks to more than one LLM instrumentation convention, and a
+ * given span only carries one of them. Each normalized field maps to an
+ * ordered list of candidate attribute keys; the first key present on a
+ * span wins. Listed by convention precedence:
+ *
+ * 1. **Vercel AI SDK** (`ai.*`) — kept first for back-compat with the
+ *    original single-convention behaviour.
+ * 2. **OpenTelemetry GenAI** (`gen_ai.*`) — the cross-vendor standard
+ *    emitted by Logfire, OpenLLMetry, the OTel-native SDKs, etc. Both
+ *    the current message-array attrs and the older prompt/completion +
+ *    `prompt_tokens`/`completion_tokens` spellings are accepted.
+ *
+ * This is the single source of truth for field extraction; the SQL
+ * layer builds COALESCE expressions from these lists so adding a
+ * convention is a one-line change here.
+ */
+export const AI_FIELD_KEYS = {
+	functionId: ["ai.telemetry.functionId", "gen_ai.agent.name"],
+	provider: ["ai.model.provider", "gen_ai.system", "gen_ai.provider.name"],
+	model: ["ai.model.id", "gen_ai.request.model", "gen_ai.response.model"],
+	sessionId: ["ai.telemetry.metadata.sessionId", "gen_ai.conversation.id"],
+	userId: ["ai.telemetry.metadata.userId"],
+	finishReason: ["ai.response.finishReason", "gen_ai.response.finish_reasons"],
+	inputTokens: ["ai.usage.inputTokens", "gen_ai.usage.input_tokens", "gen_ai.usage.prompt_tokens"],
+	outputTokens: ["ai.usage.outputTokens", "gen_ai.usage.output_tokens", "gen_ai.usage.completion_tokens"],
+	totalTokens: ["ai.usage.totalTokens", "gen_ai.usage.total_tokens"],
+	cachedInputTokens: ["ai.usage.cachedInputTokens", "gen_ai.usage.cache_read_input_tokens"],
+	reasoningTokens: ["ai.usage.reasoningTokens", "gen_ai.usage.reasoning_tokens"],
+	msToFirstChunk: ["ai.response.msToFirstChunk"],
+	msToFinish: ["ai.response.msToFinish"],
+	avgOutputTokensPerSecond: ["ai.response.avgOutputTokensPerSecond"],
+	promptMessages: ["ai.prompt.messages", "gen_ai.input.messages"],
+	prompt: ["ai.prompt", "gen_ai.prompt", "gen_ai.system_instructions"],
+	responseText: ["ai.response.text", "gen_ai.output.messages", "gen_ai.completion"],
+	tools: ["ai.prompt.tools", "gen_ai.tool.definitions"],
+	providerMetadata: ["ai.response.providerMetadata"],
+} as const satisfies Record<string, readonly string[]>
+
+/**
+ * Presence of any of these keys marks a span as an OTel GenAI call,
+ * even though its span name isn't `ai.*`. Used by the AI-call detector
+ * alongside the Vercel `operation_name LIKE 'ai.%'` heuristic.
+ */
+export const GEN_AI_MARKER_KEYS = ["gen_ai.operation.name", "gen_ai.system", "gen_ai.request.model"] as const
+
+/** Attribute key + sentinel that identify a GenAI tool-execution child span. */
+export const GEN_AI_OPERATION_KEY = "gen_ai.operation.name"
+export const GEN_AI_EXECUTE_TOOL = "execute_tool"
+export const GEN_AI_TOOL_NAME_KEY = "gen_ai.tool.name"
+
+/**
  * Attribute keys that carry LLM prompt/response content and should be
  * indexed in the span-attribute FTS table. These are the keys emitted by
  * well-known LLM instrumentation conventions:

@@ -4,7 +4,7 @@ import { dirname } from "node:path"
 import { Clock, Effect, Layer, Schedule, Context } from "effect"
 import { config } from "../config.js"
 import type { AiCallDetail, AiCallSummary, FacetItem, LogItem, SpanItem, StatsItem, TraceItem, TraceSummaryItem, TraceSpanEvent, TraceSpanItem } from "../domain.js"
-import { AI_ATTR_MAP, AI_FTS_KEYS, AI_TEXT_SEARCH_KEYS, truncatePreview } from "../domain.js"
+import { AI_FIELD_KEYS, AI_FTS_KEYS, AI_TEXT_SEARCH_KEYS, GEN_AI_EXECUTE_TOOL, GEN_AI_MARKER_KEYS, GEN_AI_OPERATION_KEY, GEN_AI_TOOL_NAME_KEY, truncatePreview } from "../domain.js"
 import { attributeMap, nanosToMilliseconds, parseAnyValue, spanKindLabel, spanStatusLabel, stringifyValue, type OtlpLogExportRequest, type OtlpTraceExportRequest } from "../otlp.js"
 
 const isSqliteLockError = (error: unknown) =>
@@ -2043,14 +2043,60 @@ export const makeTelemetryStoreLayer = (opts: TelemetryStoreOptions) => Layer.ef
 			return parts[0] ?? operationName
 		}
 
+		// Flattened, de-duplicated set of every attribute key any normalized AI
+		// field can be sourced from — used to batch-load span attributes once.
+		// Includes the GenAI operation key so the summary path can resolve the
+		// operation label (it isn't a normalized field of its own).
+		const AI_ALL_FIELD_KEYS = [...new Set([...Object.values(AI_FIELD_KEYS).flat(), GEN_AI_OPERATION_KEY])]
+
+		/** First present value across a field's candidate keys (convention-agnostic). */
+		const firstAttr = (attrs: Map<string, string> | undefined, keys: readonly string[]): string | null => {
+			if (!attrs) return null
+			for (const key of keys) {
+				const v = attrs.get(key)
+				if (v != null) return v
+			}
+			return null
+		}
+
+		/**
+		 * Operation label. Vercel encodes it in the span name (`ai.streamText`);
+		 * OTel GenAI puts it in `gen_ai.operation.name` (`chat`, `embeddings`, …)
+		 * with a free-form span name.
+		 */
+		const resolveAiOperation = (operationName: string, attrs: Map<string, string> | undefined): string => {
+			if (operationName.startsWith("ai.")) return parseAiOperation(operationName)
+			return attrs?.get(GEN_AI_OPERATION_KEY) ?? parseAiOperation(operationName)
+		}
+
+		/**
+		 * SQL fragment yielding the first non-null attribute value across the
+		 * candidate keys for the span aliased `s`, as a correlated COALESCE of
+		 * subqueries. Returns the fragment and its bind params (the keys).
+		 */
+		const coalesceAttrSql = (keys: readonly string[]): { sql: string; params: string[] } => {
+			const sub = keys.map(() => "(SELECT value FROM span_attributes a WHERE a.trace_id = s.trace_id AND a.span_id = s.span_id AND a.key = ? LIMIT 1)")
+			return { sql: `COALESCE(${sub.join(", ")}, 'unknown')`, params: [...keys] }
+		}
+
 		/** Builds WHERE clauses for AI call search against the spans table (aliased as s) */
 		const buildAiWhereClauses = (input: AiCallSearch | AiCallStatsSearch, cutoff: number) => {
+			// A "primary" AI call is either a Vercel `ai.*` span (minus its
+			// internal `.do*` sub-spans) or any span carrying OTel GenAI markers
+			// — but not a GenAI tool-execution child, which surfaces as a tool
+			// call rather than a call of its own.
+			const genAiMarkers = GEN_AI_MARKER_KEYS.map(() => "?").join(", ")
 			const clauses: string[] = [
-				"s.operation_name LIKE 'ai.%'",
-				"s.operation_name NOT LIKE 'ai.%.do%'",
+				`(
+					(s.operation_name LIKE 'ai.%' AND s.operation_name NOT LIKE 'ai.%.do%')
+					OR (
+						EXISTS (SELECT 1 FROM span_attributes m WHERE m.trace_id = s.trace_id AND m.span_id = s.span_id AND m.key IN (${genAiMarkers}))
+						AND NOT EXISTS (SELECT 1 FROM span_attributes et WHERE et.trace_id = s.trace_id AND et.span_id = s.span_id AND et.key = ? AND et.value = ?)
+					)
+				)`,
 				"s.start_time_ms >= ?",
 			]
-			const params: Array<string | number> = [cutoff]
+			const params: Array<string | number> = [...GEN_AI_MARKER_KEYS, GEN_AI_OPERATION_KEY, GEN_AI_EXECUTE_TOOL, cutoff]
 
 			if (input.service) {
 				clauses.push("s.service_name = ?")
@@ -2069,20 +2115,24 @@ export const makeTelemetryStoreLayer = (opts: TelemetryStoreOptions) => Layer.ef
 				params.push(input.minDurationMs)
 			}
 			if (input.operation) {
-				clauses.push("s.operation_name LIKE ?")
-				params.push(`ai.${input.operation}%`)
+				// Vercel: encoded in the span name. GenAI: in gen_ai.operation.name.
+				clauses.push("(s.operation_name LIKE ? OR EXISTS (SELECT 1 FROM span_attributes WHERE span_attributes.trace_id = s.trace_id AND span_attributes.span_id = s.span_id AND key = ? AND value = ?))")
+				params.push(`ai.${input.operation}%`, GEN_AI_OPERATION_KEY, input.operation)
 			}
 
-			// Named attribute filters via span_attributes
-			const attrFilters: Array<[string, string]> = []
-			if (input.sessionId) attrFilters.push([AI_ATTR_MAP.sessionId, input.sessionId])
-			if (input.functionId) attrFilters.push([AI_ATTR_MAP.functionId, input.functionId])
-			if (input.provider) attrFilters.push([AI_ATTR_MAP.provider, input.provider])
-			if (input.model) attrFilters.push([AI_ATTR_MAP.model, input.model])
+			// Named attribute filters via span_attributes, matched across every
+			// candidate key for the field so a filter works regardless of which
+			// convention emitted the span.
+			const attrFilters: Array<[readonly string[], string]> = []
+			if (input.sessionId) attrFilters.push([AI_FIELD_KEYS.sessionId, input.sessionId])
+			if (input.functionId) attrFilters.push([AI_FIELD_KEYS.functionId, input.functionId])
+			if (input.provider) attrFilters.push([AI_FIELD_KEYS.provider, input.provider])
+			if (input.model) attrFilters.push([AI_FIELD_KEYS.model, input.model])
 
-			for (const [key, value] of attrFilters) {
-				clauses.push("EXISTS (SELECT 1 FROM span_attributes WHERE span_attributes.trace_id = s.trace_id AND span_attributes.span_id = s.span_id AND key = ? AND value = ?)")
-				params.push(key, value)
+			for (const [keys, value] of attrFilters) {
+				const keyPlaceholders = keys.map(() => "?").join(", ")
+				clauses.push(`EXISTS (SELECT 1 FROM span_attributes WHERE span_attributes.trace_id = s.trace_id AND span_attributes.span_id = s.span_id AND key IN (${keyPlaceholders}) AND value = ?)`)
+				params.push(...keys, value)
 			}
 
 			// Text search across prompt/response/tool attribute values via
@@ -2158,62 +2208,59 @@ export const makeTelemetryStoreLayer = (opts: TelemetryStoreOptions) => Layer.ef
 
 				if (rows.length === 0) return [] as readonly AiCallSummary[]
 
-				// Batch-load the attributes we need for summaries
-				const summaryAttrKeys = [
-					AI_ATTR_MAP.functionId, AI_ATTR_MAP.provider, AI_ATTR_MAP.model,
-					AI_ATTR_MAP.sessionId, AI_ATTR_MAP.userId, AI_ATTR_MAP.finishReason,
-					AI_ATTR_MAP.inputTokens, AI_ATTR_MAP.outputTokens, AI_ATTR_MAP.totalTokens,
-					AI_ATTR_MAP.cachedInputTokens, AI_ATTR_MAP.reasoningTokens,
-					AI_ATTR_MAP.promptMessages, AI_ATTR_MAP.prompt, AI_ATTR_MAP.responseText,
-				]
-				const attrMap = loadSpanAttrValues(rows, summaryAttrKeys)
+				// Batch-load every attribute any summary field can come from.
+				const attrMap = loadSpanAttrValues(rows, AI_ALL_FIELD_KEYS)
 
-				// Count tool call child spans per AI span
+				// Count tool-call child spans per AI span — Vercel `ai.toolCall*`
+				// spans and OTel GenAI `execute_tool` spans alike.
 				const spanPlaceholders = rows.map(() => "(?, ?)").join(", ")
 				const spanParams = rows.flatMap((r) => [r.trace_id, r.span_id])
 				const toolCountRows = db.query(`
-					SELECT parent_span_id, COUNT(*) AS cnt
-					FROM spans
-					WHERE (trace_id, parent_span_id) IN (VALUES ${spanPlaceholders})
-					AND operation_name LIKE 'ai.toolCall%'
-					GROUP BY trace_id, parent_span_id
-				`).all(...spanParams) as Array<{ parent_span_id: string; cnt: number }>
+					SELECT sc.parent_span_id AS parent_span_id, COUNT(*) AS cnt
+					FROM spans sc
+					WHERE (sc.trace_id, sc.parent_span_id) IN (VALUES ${spanPlaceholders})
+					AND (
+						sc.operation_name LIKE 'ai.toolCall%'
+						OR EXISTS (SELECT 1 FROM span_attributes a WHERE a.trace_id = sc.trace_id AND a.span_id = sc.span_id AND a.key = ? AND a.value = ?)
+					)
+					GROUP BY sc.trace_id, sc.parent_span_id
+				`).all(...spanParams, GEN_AI_OPERATION_KEY, GEN_AI_EXECUTE_TOOL) as Array<{ parent_span_id: string; cnt: number }>
 				const toolCounts = new Map(toolCountRows.map((r) => [r.parent_span_id, r.cnt]))
 
 				return rows.map((row): AiCallSummary => {
 					const spanKey = `${row.trace_id}:${row.span_id}`
 					const attrs = attrMap.get(spanKey)
-					const get = (key: string) => attrs?.get(key) ?? null
-					const getNum = (key: string) => {
-						const v = get(key)
+					const f = (keys: readonly string[]) => firstAttr(attrs, keys)
+					const fNum = (keys: readonly string[]) => {
+						const v = f(keys)
 						return v != null ? Number(v) : null
 					}
 
-					const promptContent = get(AI_ATTR_MAP.promptMessages) ?? get(AI_ATTR_MAP.prompt)
+					const promptContent = f(AI_FIELD_KEYS.promptMessages) ?? f(AI_FIELD_KEYS.prompt)
 
 					return {
 						traceId: row.trace_id,
 						spanId: row.span_id,
-						operation: parseAiOperation(row.operation_name),
+						operation: resolveAiOperation(row.operation_name, attrs),
 						service: row.service_name,
-						functionId: get(AI_ATTR_MAP.functionId),
-						provider: get(AI_ATTR_MAP.provider),
-						model: get(AI_ATTR_MAP.model),
+						functionId: f(AI_FIELD_KEYS.functionId),
+						provider: f(AI_FIELD_KEYS.provider),
+						model: f(AI_FIELD_KEYS.model),
 						status: row.status === "error" ? "error" : "ok",
 						startedAt: new Date(row.start_time_ms).toISOString(),
 						durationMs: row.duration_ms,
-						sessionId: get(AI_ATTR_MAP.sessionId),
-						userId: get(AI_ATTR_MAP.userId),
+						sessionId: f(AI_FIELD_KEYS.sessionId),
+						userId: f(AI_FIELD_KEYS.userId),
 						promptPreview: truncatePreview(promptContent),
-						responsePreview: truncatePreview(get(AI_ATTR_MAP.responseText)),
-						finishReason: get(AI_ATTR_MAP.finishReason),
+						responsePreview: truncatePreview(f(AI_FIELD_KEYS.responseText)),
+						finishReason: f(AI_FIELD_KEYS.finishReason),
 						toolCallCount: toolCounts.get(row.span_id) ?? 0,
 						usage: {
-							inputTokens: getNum(AI_ATTR_MAP.inputTokens),
-							outputTokens: getNum(AI_ATTR_MAP.outputTokens),
-							totalTokens: getNum(AI_ATTR_MAP.totalTokens),
-							cachedInputTokens: getNum(AI_ATTR_MAP.cachedInputTokens),
-							reasoningTokens: getNum(AI_ATTR_MAP.reasoningTokens),
+							inputTokens: fNum(AI_FIELD_KEYS.inputTokens),
+							outputTokens: fNum(AI_FIELD_KEYS.outputTokens),
+							totalTokens: fNum(AI_FIELD_KEYS.totalTokens),
+							cachedInputTokens: fNum(AI_FIELD_KEYS.cachedInputTokens),
+							reasoningTokens: fNum(AI_FIELD_KEYS.reasoningTokens),
 						},
 					}
 				})
@@ -2223,7 +2270,7 @@ export const makeTelemetryStoreLayer = (opts: TelemetryStoreOptions) => Layer.ef
 		const getAiCall = Effect.fn("motel/TelemetryStore.getAiCall")(function* (spanId: string) {
 			return yield* Effect.sync(() => {
 				const row = db.query(`
-					SELECT * FROM spans WHERE span_id = ? AND operation_name LIKE 'ai.%' LIMIT 1
+					SELECT * FROM spans WHERE span_id = ? LIMIT 1
 				`).get(spanId) as SpanRow | null
 				if (!row) return null
 
@@ -2233,24 +2280,36 @@ export const makeTelemetryStoreLayer = (opts: TelemetryStoreOptions) => Layer.ef
 					WHERE trace_id = ? AND span_id = ?
 				`).all(row.trace_id, row.span_id) as Array<{ key: string; value: string }>
 				const attrs = new Map(attrRows.map((r) => [r.key, r.value]))
-				const get = (key: string) => attrs.get(key) ?? null
-				const getNum = (key: string) => {
-					const v = get(key)
+
+				// Only AI spans have a detail view. A span qualifies if it's a
+				// Vercel `ai.*` span or carries OTel GenAI markers; anything else
+				// (a plain HTTP/db span the caller mistook for an AI call) → null.
+				const isAiCallSpan = row.operation_name.startsWith("ai.") || GEN_AI_MARKER_KEYS.some((k) => attrs.has(k))
+				if (!isAiCallSpan) return null
+
+				const f = (keys: readonly string[]) => firstAttr(attrs, keys)
+				const fNum = (keys: readonly string[]) => {
+					const v = f(keys)
 					return v != null ? Number(v) : null
 				}
 
-				// Load tool call child spans
+				// Load tool-call child spans — Vercel `ai.toolCall*` and OTel
+				// GenAI `execute_tool` spans alike.
 				const toolCallRows = db.query(`
-					SELECT span_id, operation_name, duration_ms, status, attributes_json
-					FROM spans
-					WHERE trace_id = ? AND parent_span_id = ? AND operation_name LIKE 'ai.toolCall%'
-					ORDER BY start_time_ms ASC
-				`).all(row.trace_id, row.span_id) as SpanRow[]
+					SELECT sc.span_id AS span_id, sc.operation_name AS operation_name, sc.duration_ms AS duration_ms, sc.status AS status, sc.attributes_json AS attributes_json
+					FROM spans sc
+					WHERE sc.trace_id = ? AND sc.parent_span_id = ?
+					AND (
+						sc.operation_name LIKE 'ai.toolCall%'
+						OR EXISTS (SELECT 1 FROM span_attributes a WHERE a.trace_id = sc.trace_id AND a.span_id = sc.span_id AND a.key = ? AND a.value = ?)
+					)
+					ORDER BY sc.start_time_ms ASC
+				`).all(row.trace_id, row.span_id, GEN_AI_OPERATION_KEY, GEN_AI_EXECUTE_TOOL) as SpanRow[]
 
 				const toolCalls = toolCallRows.map((tc) => {
 					const tcAttrs = JSON.parse(tc.attributes_json) as Record<string, string>
 					return {
-						name: tcAttrs["ai.toolCall.name"] ?? tc.operation_name,
+						name: tcAttrs["ai.toolCall.name"] ?? tcAttrs[GEN_AI_TOOL_NAME_KEY] ?? tc.operation_name,
 						spanId: tc.span_id,
 						status: tc.status === "error" ? "error" as const : "ok" as const,
 						durationMs: tc.duration_ms,
@@ -2264,21 +2323,21 @@ export const makeTelemetryStoreLayer = (opts: TelemetryStoreOptions) => Layer.ef
 				const logs = logRows.map(parseLogRow)
 
 				// Parse prompt - try as JSON first for structured display
-				const promptRaw = get(AI_ATTR_MAP.promptMessages) ?? get(AI_ATTR_MAP.prompt)
+				const promptRaw = f(AI_FIELD_KEYS.promptMessages) ?? f(AI_FIELD_KEYS.prompt)
 				let promptMessages: unknown = null
 				if (promptRaw) {
 					try { promptMessages = JSON.parse(promptRaw) } catch { promptMessages = promptRaw }
 				}
 
 				// Parse tools
-				const toolsRaw = get(AI_ATTR_MAP.tools)
+				const toolsRaw = f(AI_FIELD_KEYS.tools)
 				let toolsAvailable: unknown = null
 				if (toolsRaw) {
 					try { toolsAvailable = JSON.parse(toolsRaw) } catch { toolsAvailable = toolsRaw }
 				}
 
 				// Parse provider metadata
-				const providerMetaRaw = get(AI_ATTR_MAP.providerMetadata)
+				const providerMetaRaw = f(AI_FIELD_KEYS.providerMetadata)
 				let providerMetadata: unknown = null
 				if (providerMetaRaw) {
 					try { providerMetadata = JSON.parse(providerMetaRaw) } catch { providerMetadata = providerMetaRaw }
@@ -2287,33 +2346,33 @@ export const makeTelemetryStoreLayer = (opts: TelemetryStoreOptions) => Layer.ef
 				return {
 					traceId: row.trace_id,
 					spanId: row.span_id,
-					operation: parseAiOperation(row.operation_name),
+					operation: resolveAiOperation(row.operation_name, attrs),
 					service: row.service_name,
-					functionId: get(AI_ATTR_MAP.functionId),
-					provider: get(AI_ATTR_MAP.provider),
-					model: get(AI_ATTR_MAP.model),
+					functionId: f(AI_FIELD_KEYS.functionId),
+					provider: f(AI_FIELD_KEYS.provider),
+					model: f(AI_FIELD_KEYS.model),
 					status: row.status === "error" ? "error" as const : "ok" as const,
 					startedAt: new Date(row.start_time_ms).toISOString(),
 					durationMs: row.duration_ms,
-					sessionId: get(AI_ATTR_MAP.sessionId),
-					userId: get(AI_ATTR_MAP.userId),
-					finishReason: get(AI_ATTR_MAP.finishReason),
+					sessionId: f(AI_FIELD_KEYS.sessionId),
+					userId: f(AI_FIELD_KEYS.userId),
+					finishReason: f(AI_FIELD_KEYS.finishReason),
 					promptMessages,
-					responseText: get(AI_ATTR_MAP.responseText),
+					responseText: f(AI_FIELD_KEYS.responseText),
 					toolCalls,
 					toolsAvailable,
 					providerMetadata,
 					usage: {
-						inputTokens: getNum(AI_ATTR_MAP.inputTokens),
-						outputTokens: getNum(AI_ATTR_MAP.outputTokens),
-						totalTokens: getNum(AI_ATTR_MAP.totalTokens),
-						cachedInputTokens: getNum(AI_ATTR_MAP.cachedInputTokens),
-						reasoningTokens: getNum(AI_ATTR_MAP.reasoningTokens),
+						inputTokens: fNum(AI_FIELD_KEYS.inputTokens),
+						outputTokens: fNum(AI_FIELD_KEYS.outputTokens),
+						totalTokens: fNum(AI_FIELD_KEYS.totalTokens),
+						cachedInputTokens: fNum(AI_FIELD_KEYS.cachedInputTokens),
+						reasoningTokens: fNum(AI_FIELD_KEYS.reasoningTokens),
 					},
 					timing: {
-						msToFirstChunk: getNum(AI_ATTR_MAP.msToFirstChunk),
-						msToFinish: getNum(AI_ATTR_MAP.msToFinish),
-						avgOutputTokensPerSecond: getNum(AI_ATTR_MAP.avgOutputTokensPerSecond),
+						msToFirstChunk: fNum(AI_FIELD_KEYS.msToFirstChunk),
+						msToFinish: fNum(AI_FIELD_KEYS.msToFinish),
+						avgOutputTokensPerSecond: fNum(AI_FIELD_KEYS.avgOutputTokensPerSecond),
 					},
 					logs,
 				} satisfies AiCallDetail
@@ -2342,27 +2401,28 @@ export const makeTelemetryStoreLayer = (opts: TelemetryStoreOptions) => Layer.ef
 					if (input.agg === "avg_duration") return rows.map((r) => ({ group: r.grp, value: r.avg_dur, count: r.count }))
 				}
 
-				// For attribute-based groupBy, we need to join span_attributes
-				const groupByAttrKey = input.groupBy === "provider" ? AI_ATTR_MAP.provider
-					: input.groupBy === "model" ? AI_ATTR_MAP.model
-					: input.groupBy === "functionId" ? AI_ATTR_MAP.functionId
-					: input.groupBy === "sessionId" ? AI_ATTR_MAP.sessionId
+				// For attribute-based groupBy, resolve the group value across every
+				// candidate key for the field so Vercel and GenAI spans bucket
+				// together (e.g. provider "anthropic" from either convention).
+				const groupByKeys = input.groupBy === "provider" ? AI_FIELD_KEYS.provider
+					: input.groupBy === "model" ? AI_FIELD_KEYS.model
+					: input.groupBy === "functionId" ? AI_FIELD_KEYS.functionId
+					: input.groupBy === "sessionId" ? AI_FIELD_KEYS.sessionId
 					: null
 
-				if (!groupByAttrKey) return []
+				if (!groupByKeys) return []
 
 				// First get the matching spans with their group values
+				const grpExpr = coalesceAttrSql(groupByKeys)
 				const rows = db.query(`
 					SELECT
-						COALESCE(ga.value, 'unknown') AS grp,
+						${grpExpr.sql} AS grp,
 						s.span_id,
 						s.duration_ms,
 						s.status
 					FROM spans AS s
-					LEFT JOIN span_attributes AS ga
-						ON ga.trace_id = s.trace_id AND ga.span_id = s.span_id AND ga.key = ?
 					WHERE ${clauses.join(" AND ")}
-				`).all(groupByAttrKey, ...params) as Array<{ grp: string; span_id: string; duration_ms: number; status: string }>
+				`).all(...grpExpr.params, ...params) as Array<{ grp: string; span_id: string; duration_ms: number; status: string }>
 
 				// Group and aggregate in JS (need p95 and token aggregation)
 				const groups = new Map<string, { durations: number[]; count: number; spanIds: string[] }>()
@@ -2376,15 +2436,18 @@ export const makeTelemetryStoreLayer = (opts: TelemetryStoreOptions) => Layer.ef
 
 				// For token aggregations, batch-load from span_attributes
 				if (input.agg === "total_input_tokens" || input.agg === "total_output_tokens") {
-					const tokenKey = input.agg === "total_input_tokens" ? AI_ATTR_MAP.inputTokens : AI_ATTR_MAP.outputTokens
+					const tokenKeys = input.agg === "total_input_tokens" ? AI_FIELD_KEYS.inputTokens : AI_FIELD_KEYS.outputTokens
 					const allSpanIds = [...groups.values()].flatMap((b) => b.spanIds)
 					if (allSpanIds.length > 0) {
 						const placeholders = allSpanIds.map(() => "?").join(", ")
+						const keyPlaceholders = tokenKeys.map(() => "?").join(", ")
+						// A span carries at most one convention's token key; MAX picks it.
 						const tokenRows = db.query(`
-							SELECT span_id, CAST(value AS REAL) AS tokens
+							SELECT span_id, MAX(CAST(value AS REAL)) AS tokens
 							FROM span_attributes
-							WHERE key = ? AND span_id IN (${placeholders})
-						`).all(tokenKey, ...allSpanIds) as Array<{ span_id: string; tokens: number }>
+							WHERE key IN (${keyPlaceholders}) AND span_id IN (${placeholders})
+							GROUP BY span_id
+						`).all(...tokenKeys, ...allSpanIds) as Array<{ span_id: string; tokens: number }>
 
 						const tokenBySpan = new Map(tokenRows.map((r) => [r.span_id, r.tokens]))
 
