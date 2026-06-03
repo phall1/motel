@@ -53,10 +53,26 @@ const isProtobufContentType = (contentType: string | undefined) => {
 	const mediaType = contentType?.split(";", 1)[0]?.trim().toLowerCase()
 	return mediaType === "application/x-protobuf" || mediaType === "application/protobuf"
 }
-const otlpRequestBody = (request: OtlpHttpRequest, decodeProtobuf: (bytes: Uint8Array) => unknown) =>
-	isProtobufContentType(request.headers["content-type"])
+const isGzipEncoding = (contentEncoding: string | undefined) => {
+	const enc = contentEncoding?.toLowerCase() ?? ""
+	return enc.includes("gzip")
+}
+const decodeOtlpBytes = (bytes: Uint8Array, isProtobuf: boolean, decodeProtobuf: (b: Uint8Array) => unknown): unknown =>
+	isProtobuf ? decodeProtobuf(bytes) : JSON.parse(new TextDecoder().decode(bytes))
+// OTLP/HTTP exporters commonly gzip the body (the Go SDK and the OTel
+// Collector default to it). When Content-Encoding is gzip we read raw bytes,
+// gunzip, then decode as protobuf or JSON per Content-Type. Otherwise we keep
+// the streaming JSON parse / direct protobuf path.
+const otlpRequestBody = (request: OtlpHttpRequest, decodeProtobuf: (bytes: Uint8Array) => unknown) => {
+	const isProtobuf = isProtobufContentType(request.headers["content-type"])
+	if (isGzipEncoding(request.headers["content-encoding"])) {
+		return Effect.map(request.arrayBuffer, (body) =>
+			decodeOtlpBytes(Bun.gunzipSync(new Uint8Array(body)), isProtobuf, decodeProtobuf))
+	}
+	return isProtobuf
 		? Effect.map(request.arrayBuffer, (body) => decodeProtobuf(new Uint8Array(body)))
 		: request.json
+}
 // Response-building helpers are generic in R so a handler can depend
 // on TelemetryStore (query path) or AsyncIngest (worker-RPC path)
 // without forcing every handler onto the same service surface.
