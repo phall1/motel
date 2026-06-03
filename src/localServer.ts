@@ -412,6 +412,10 @@ const TelemetryGroupLive = HttpApiBuilder.group(
 					const attributeContainsFilters = attributeContainsFiltersFromQuery(url)
 					const limit = parseBoundedLimit(url.searchParams.get("limit"), SPAN_DEFAULT_LIMIT, SPAN_MAX_LIMIT)
 					const lookbackMinutes = parseBoundedLookbackMinutes(url.searchParams.get("lookback"), TRACE_DEFAULT_LOOKBACK, TRACE_MAX_LOOKBACK)
+					const minDurationRaw = url.searchParams.get("minDurationMs")
+					const minDurationMs = minDurationRaw != null && Number.isFinite(Number(minDurationRaw)) ? Number(minDurationRaw) : null
+					const sortParam = url.searchParams.get("sort")
+					const sort = sortParam === "duration_desc" || sortParam === "start_desc" ? sortParam : null
 					const data = yield* withTraceQuery((store) =>
 						store.searchSpans({
 							serviceName: url.searchParams.get("service"),
@@ -419,6 +423,8 @@ const TelemetryGroupLive = HttpApiBuilder.group(
 							operation: url.searchParams.get("operation"),
 							parentOperation: url.searchParams.get("parentOperation"),
 							status: (url.searchParams.get("status") as "ok" | "error" | null) ?? null,
+							minDurationMs,
+							sort,
 							attributeFilters,
 							attributeContainsFilters,
 							limit: limit + 1,

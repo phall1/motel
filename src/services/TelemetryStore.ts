@@ -79,6 +79,8 @@ interface SpanSearch {
 	readonly operation?: string | null
 	readonly parentOperation?: string | null
 	readonly status?: "ok" | "error" | null
+	readonly minDurationMs?: number | null
+	readonly sort?: "duration_desc" | "start_desc" | null
 	readonly lookbackMinutes?: number
 	readonly limit?: number
 	readonly attributeFilters?: Readonly<Record<string, string>>
@@ -1478,6 +1480,10 @@ export const makeTelemetryStoreLayer = (opts: TelemetryStoreOptions) => Layer.ef
 					clauses.push("s.status = ?")
 					params.push(input.status)
 				}
+				if (input.minDurationMs != null) {
+					clauses.push("s.duration_ms >= ?")
+					params.push(input.minDurationMs)
+				}
 
 				const exactAttrMatch = buildExactAttributeMatchSubquery("span_attributes", ["trace_id", "span_id"], input.attributeFilters)
 				if (exactAttrMatch) {
@@ -1491,11 +1497,15 @@ export const makeTelemetryStoreLayer = (opts: TelemetryStoreOptions) => Layer.ef
 					params.push(...containsAttrMatch.params)
 				}
 
+				// Order in the CANDIDATE query so the intended top-N survive the
+				// candidateLimit cap (e.g. for duration_desc, the slowest spans must
+				// not be dropped before we slice to `limit`).
+				const orderBy = input.sort === "duration_desc" ? "s.duration_ms DESC, s.start_time_ms DESC" : "s.start_time_ms DESC"
 				const rows = db.query(`
 					SELECT *
 					${fromSql}
 					WHERE ${clauses.join(" AND ")}
-					ORDER BY s.start_time_ms DESC
+					ORDER BY ${orderBy}
 					LIMIT ?
 				`).all(...joinParams, ...params, candidateLimit) as SpanRow[]
 

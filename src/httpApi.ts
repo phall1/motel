@@ -226,13 +226,19 @@ export const MotelHttpApi = HttpApi.make("MotelTelemetry")
 						operation: Schema.optionalKey(Schema.String),
 						parentOperation: Schema.optionalKey(Schema.String),
 						status: Schema.optionalKey(TraceSpanStatus),
+						minDurationMs: Schema.optionalKey(Schema.Number).pipe(
+							Schema.annotateKey({ description: "Only return spans at least this many ms in duration." }),
+						),
+						sort: Schema.optionalKey(Schema.Literals(["duration_desc", "start_desc"])).pipe(
+							Schema.annotateKey({ description: "Sort order. duration_desc = slowest first; default start_desc = newest first." }),
+						),
 						lookback: LookbackParam,
 						limit: LimitParam,
 					},
 					success: PaginatedSpanList,
 				})
 					.annotate(OpenApi.Summary, "Search spans directly")
-					.annotate(OpenApi.Description, "Search spans directly instead of root traces. Supports service, traceId, operation, parentOperation, status, lookback, limit, attr.<key>=<value> (exact match), and attrContains.<key>=<substring> (case-insensitive substring search inside attribute values) in the query string."),
+					.annotate(OpenApi.Description, "Search spans directly instead of root traces. Supports service, traceId, operation, parentOperation, status, minDurationMs, sort (duration_desc|start_desc), lookback, limit, attr.<key>=<value> (exact match), and attrContains.<key>=<substring> (case-insensitive substring search inside attribute values). Use minDurationMs + sort=duration_desc to find the slowest spans in a trace or service."),
 
 				HttpApiEndpoint.get("logs", "/api/logs", {
 					query: {

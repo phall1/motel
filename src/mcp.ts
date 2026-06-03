@@ -160,6 +160,12 @@ const SearchSpansTool = Tool.make("motel_search_spans", {
 			Schema.String.annotate({ description: "Substring match on parent operation name." }),
 		),
 		status: Status,
+		minDurationMs: Schema.optional(
+			Schema.Number.annotate({ description: "Only return spans at least this many ms in duration — use to find slow spans." }),
+		),
+		sort: Schema.optional(
+			Schema.Literals(["duration_desc", "start_desc"]).annotate({ description: "Sort order. duration_desc = slowest first (pair with minDurationMs to triage latency); default start_desc = newest first." }),
+		),
 		attributes: Attributes,
 		attributeContains: AttributeContains,
 		lookback: Lookback,

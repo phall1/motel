@@ -56,6 +56,8 @@ export type SearchSpansInput = {
 	readonly operation?: string
 	readonly parentOperation?: string
 	readonly status?: "ok" | "error"
+	readonly minDurationMs?: number
+	readonly sort?: "duration_desc" | "start_desc"
 	readonly lookback?: string
 	readonly limit?: number
 	readonly attributes?: AttributeFilters
@@ -219,6 +221,8 @@ export const MotelClientLive = Layer.effect(
 					operation: input.operation,
 					parentOperation: input.parentOperation,
 					status: input.status,
+					minDurationMs: input.minDurationMs,
+					sort: input.sort,
 					lookback: input.lookback,
 					limit: input.limit,
 				}, input.attributes, input.attributeContains),

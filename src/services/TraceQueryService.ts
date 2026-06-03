@@ -16,7 +16,7 @@ export class TraceQueryService extends Context.Service<
 		readonly getSpan: (spanId: string) => Effect.Effect<SpanItem | null, Error>
 		readonly getAiCall: (spanId: string) => Effect.Effect<AiCallDetail | null, Error>
 		readonly listTraceSpans: (traceId: string) => Effect.Effect<readonly SpanItem[], Error>
-		readonly searchSpans: (input: { readonly serviceName?: string | null; readonly traceId?: string | null; readonly operation?: string | null; readonly parentOperation?: string | null; readonly status?: "ok" | "error" | null; readonly lookbackMinutes?: number; readonly limit?: number; readonly attributeFilters?: Readonly<Record<string, string>>; readonly attributeContainsFilters?: Readonly<Record<string, string>> }) => Effect.Effect<readonly SpanItem[], Error>
+		readonly searchSpans: (input: { readonly serviceName?: string | null; readonly traceId?: string | null; readonly operation?: string | null; readonly parentOperation?: string | null; readonly status?: "ok" | "error" | null; readonly minDurationMs?: number | null; readonly sort?: "duration_desc" | "start_desc" | null; readonly lookbackMinutes?: number; readonly limit?: number; readonly attributeFilters?: Readonly<Record<string, string>>; readonly attributeContainsFilters?: Readonly<Record<string, string>> }) => Effect.Effect<readonly SpanItem[], Error>
 	}
 >()("motel/TraceQueryService") {}
 

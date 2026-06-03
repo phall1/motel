@@ -852,4 +852,46 @@ describe("motel telemetry store", () => {
 		expect(motelOpenApiSpec.paths["/api/ai/calls/{spanId}"]).toBeDefined()
 		expect(motelOpenApiSpec.paths["/api/ai/stats"]).toBeDefined()
 	})
+
+	it("searches spans by minDurationMs and sorts slowest-first", async () => {
+		// Dedicated trace so it cannot perturb earlier count assertions.
+		const nowNanos = BigInt(Date.now()) * 1_000_000n
+		const ms = 1_000_000n
+		const span = (spanId: string, name: string, durMs: bigint) => ({
+			traceId: "spanperftrace000000000000000000a",
+			spanId,
+			name,
+			kind: 2,
+			startTimeUnixNano: String(nowNanos),
+			endTimeUnixNano: String(nowNanos + durMs * ms),
+			attributes: [],
+		})
+		await storeRuntime.runPromise(
+			Effect.flatMap(TelemetryStore, (store) =>
+				store.ingestTraces({
+					resourceSpans: [{
+						resource: { attributes: [{ key: "service.name", value: { stringValue: "spanperf" } }] },
+						scopeSpans: [{
+							scope: { name: "t" },
+							spans: [span("spanperffast0001", "fast", 10n), span("spanperfslow0001", "slow", 200n), span("spanperfmid00001", "mid", 50n)],
+						}],
+					}],
+				}),
+			).pipe(Effect.provideService(References.MinimumLogLevel, "None")),
+		)
+
+		const sorted = await storeRuntime.runPromise(
+			Effect.flatMap(TelemetryStore, (store) => store.searchSpans({ serviceName: "spanperf", sort: "duration_desc" })).pipe(
+				Effect.provideService(References.MinimumLogLevel, "None"),
+			),
+		)
+		expect(sorted.map((s) => s.span.operationName)).toEqual(["slow", "mid", "fast"])
+
+		const slowOnly = await storeRuntime.runPromise(
+			Effect.flatMap(TelemetryStore, (store) => store.searchSpans({ serviceName: "spanperf", minDurationMs: 100 })).pipe(
+				Effect.provideService(References.MinimumLogLevel, "None"),
+			),
+		)
+		expect(slowOnly.map((s) => s.span.operationName)).toEqual(["slow"])
+	})
 })
